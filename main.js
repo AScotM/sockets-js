@@ -7,12 +7,15 @@ const path = require("path");
 const os = require("os");
 const process = require("process");
 
+const VERSION = "2.1.0";
+
 class ToolConfig {
     constructor(options = {}) {
         this.logLevel = "INFO";
         this.jsonOutput = false;
         this.compactJson = false;
         this.help = false;
+        this.version = false;
         this.showPerformance = false;
         this.quiet = false;
         this.extended = false;
@@ -34,7 +37,7 @@ class ToolConfig {
     }
 
     apply(options) {
-        for (const [key, value] of Object.entries(options)) {
+        for (const [key, value] of Object.entries(options || {})) {
             if (Object.prototype.hasOwnProperty.call(this, key)) {
                 this[key] = value;
             }
@@ -42,7 +45,11 @@ class ToolConfig {
     }
 
     clone() {
-        return new ToolConfig(JSON.parse(JSON.stringify(this)));
+        return new ToolConfig(this.toObject());
+    }
+
+    toObject() {
+        return JSON.parse(JSON.stringify(this));
     }
 }
 
@@ -55,7 +62,7 @@ class Logger {
             ERROR: 40
         };
         this.level = this.normalizeLevel(level);
-        this.quiet = quiet;
+        this.quiet = Boolean(quiet);
         this.dedup = new Map();
         this.dedupTtlMs = 300000;
         this.dedupMaxSize = 1000;
@@ -63,7 +70,7 @@ class Logger {
 
     normalizeLevel(level) {
         const upper = String(level || "INFO").toUpperCase();
-        return this.levels[upper] ? upper : "INFO";
+        return Object.prototype.hasOwnProperty.call(this.levels, upper) ? upper : "INFO";
     }
 
     setLevel(level) {
@@ -415,6 +422,26 @@ class TerminalFormatter {
         return mapping[key] || String(key).toUpperCase();
     }
 
+    shouldRenderProtocol(proto) {
+        if (this.config.includeZeros) {
+            return true;
+        }
+        return !proto.isEmpty();
+    }
+
+    renderProtocolSection(lines, colorSet, report, key) {
+        const proto = report.tryGetProtocol(key);
+        if (!proto || !this.shouldRenderProtocol(proto)) {
+            return;
+        }
+        lines.push(`${colorSet.section}${this.formatProtocolName(key)}:${colorSet.reset}`);
+        for (const [field, value] of Object.entries(proto.toJSON())) {
+            const name = field.replace(/_/g, " ").replace(/\b\w/g, ch => ch.toUpperCase());
+            lines.push(`  ${colorSet.key}${name}:${colorSet.reset} ${value}`);
+        }
+        lines.push("");
+    }
+
     outputHumanReadable(report, metrics = null) {
         const c = this.colors();
         const lines = [];
@@ -436,44 +463,15 @@ class TerminalFormatter {
         lines.push(`${c.accent}Memory units:${c.reset} ${data.summary.total_memory_units}`);
         lines.push("");
 
-        const baseProtocols = ["tcp", "udp", "udp_lite", "raw", "frag"];
-        for (const key of baseProtocols) {
-            const proto = report.tryGetProtocol(key);
-            if (!proto) {
-                continue;
-            }
-            if (!this.config.includeZeros && proto.isEmpty()) {
-                continue;
-            }
-            lines.push(`${c.section}${this.formatProtocolName(key)}:${c.reset}`);
-            for (const [field, value] of Object.entries(proto.toJSON())) {
-                const name = field.replace(/_/g, " ").replace(/\b\w/g, ch => ch.toUpperCase());
-                lines.push(`  ${c.key}${name}:${c.reset} ${value}`);
-            }
-            lines.push("");
+        for (const key of ["tcp", "udp", "udp_lite", "raw", "frag"]) {
+            this.renderProtocolSection(lines, c, report, key);
         }
 
         if (this.config.extended) {
             lines.push(`${c.title}Extended Protocol Information${c.reset}`);
             lines.push(`${c.title}=============================${c.reset}`);
-            const extendedProtocols = ["tcp6", "udp6", "unix", "netlink", "packet", "icmp", "icmp6"];
-            for (const key of extendedProtocols) {
-                const proto = report.tryGetProtocol(key);
-                if (!proto) {
-                    continue;
-                }
-                if (!this.config.includeZeros && !proto.hasPositiveInUse() && proto.isEmpty()) {
-                    continue;
-                }
-                if (!this.config.includeZeros && !proto.hasPositiveInUse() && !proto.isEmpty()) {
-                    continue;
-                }
-                lines.push(`${c.section}${this.formatProtocolName(key)}:${c.reset}`);
-                for (const [field, value] of Object.entries(proto.toJSON())) {
-                    const name = field.replace(/_/g, " ").replace(/\b\w/g, ch => ch.toUpperCase());
-                    lines.push(`  ${c.key}${name}:${c.reset} ${value}`);
-                }
-                lines.push("");
+            for (const key of ["tcp6", "udp6", "unix", "netlink", "packet", "icmp", "icmp6"]) {
+                this.renderProtocolSection(lines, c, report, key);
             }
             if (Object.keys(report.tcp_ext).length > 0) {
                 lines.push(`${c.section}TcpExt:${c.reset}`);
@@ -524,6 +522,7 @@ class SafeFileReader {
     constructor(config, logger) {
         this.config = config;
         this.logger = logger;
+        this.allowedRootCache = null;
     }
 
     normalizePath(inputPath) {
@@ -539,14 +538,23 @@ class SafeFileReader {
     }
 
     resolvePath(filePath) {
-        const normalized = this.normalizePath(filePath);
-        return fs.realpathSync(normalized);
+        return fs.realpathSync(this.normalizePath(filePath));
+    }
+
+    getAllowedRoots() {
+        if (this.allowedRootCache) {
+            return this.allowedRootCache;
+        }
+        this.allowedRootCache = this.config.allowedRoots.map(root => {
+            const normalized = this.normalizePath(root);
+            return fs.existsSync(normalized) ? fs.realpathSync(normalized) : normalized;
+        });
+        return this.allowedRootCache;
     }
 
     isPathAllowed(resolvedPath) {
-        for (const root of this.config.allowedRoots) {
-            const resolvedRoot = fs.existsSync(root) ? fs.realpathSync(root) : root;
-            if (resolvedPath === resolvedRoot || resolvedPath.startsWith(`${resolvedRoot}${path.sep}`)) {
+        for (const root of this.getAllowedRoots()) {
+            if (resolvedPath === root || resolvedPath.startsWith(`${root}${path.sep}`)) {
                 return true;
             }
         }
@@ -565,10 +573,7 @@ class SafeFileReader {
         if (stat.size > this.config.maxFileSize) {
             throw new Error(`File size exceeds limit: ${filePath}`);
         }
-        return {
-            resolved,
-            stat
-        };
+        return { resolved, stat };
     }
 
     readLines(filePath) {
@@ -583,10 +588,7 @@ class SafeFileReader {
                 throw new Error(`Line too long in file: ${filePath}`);
             }
         }
-        return {
-            resolved,
-            lines
-        };
+        return { resolved, lines };
     }
 }
 
@@ -634,6 +636,228 @@ class IniLoader {
     }
 }
 
+class ArgParser {
+    constructor(argv) {
+        this.argv = argv;
+        this.index = 0;
+        this.updates = {};
+    }
+
+    nextValue(flag) {
+        this.index += 1;
+        if (this.index >= this.argv.length) {
+            throw new Error(`Missing value for ${flag}`);
+        }
+        return this.argv[this.index];
+    }
+
+    parse() {
+        for (this.index = 0; this.index < this.argv.length; this.index += 1) {
+            const arg = this.argv[this.index];
+            switch (arg) {
+                case "--json":
+                    this.updates.jsonOutput = true;
+                    break;
+                case "--compact-json":
+                    this.updates.jsonOutput = true;
+                    this.updates.compactJson = true;
+                    break;
+                case "--help":
+                    this.updates.help = true;
+                    break;
+                case "--version":
+                    this.updates.version = true;
+                    break;
+                case "--performance":
+                    this.updates.showPerformance = true;
+                    break;
+                case "--quiet":
+                    this.updates.quiet = true;
+                    break;
+                case "--extended":
+                    this.updates.extended = true;
+                    break;
+                case "--include-zeros":
+                    this.updates.includeZeros = true;
+                    break;
+                case "--log-level":
+                    this.updates.logLevel = String(this.nextValue(arg)).toUpperCase();
+                    break;
+                case "--path":
+                    this.updates.sockstatPath = String(this.nextValue(arg));
+                    break;
+                case "--config":
+                    this.updates.configFile = String(this.nextValue(arg));
+                    break;
+                case "--output":
+                    this.updates.outputFile = String(this.nextValue(arg));
+                    break;
+                case "--color":
+                    this.updates.color = String(this.nextValue(arg)).toLowerCase();
+                    break;
+                case "--max-file-size":
+                    this.updates.maxFileSize = Number.parseInt(String(this.nextValue(arg)), 10);
+                    break;
+                case "--max-line-count":
+                    this.updates.maxLineCount = Number.parseInt(String(this.nextValue(arg)), 10);
+                    break;
+                case "--max-line-size":
+                    this.updates.maxLineSize = Number.parseInt(String(this.nextValue(arg)), 10);
+                    break;
+                default:
+                    throw new Error(`Unknown argument: ${arg}`);
+            }
+        }
+        return this.updates;
+    }
+}
+
+class ConfigMapper {
+    static mapIni(data) {
+        const mapped = {};
+        const rules = {
+            log_level: value => ({ logLevel: String(value).toUpperCase() }),
+            json_output: value => ({ jsonOutput: Boolean(value) }),
+            compact_json: value => ({ compactJson: Boolean(value), jsonOutput: Boolean(value) || undefined }),
+            help: value => ({ help: Boolean(value) }),
+            version: value => ({ version: Boolean(value) }),
+            show_performance: value => ({ showPerformance: Boolean(value) }),
+            quiet: value => ({ quiet: Boolean(value) }),
+            extended: value => ({ extended: Boolean(value) }),
+            include_zeros: value => ({ includeZeros: Boolean(value) }),
+            sockstat_path: value => ({ sockstatPath: String(value) }),
+            sockstat6_path: value => ({ sockstat6Path: String(value) }),
+            netlink_path: value => ({ netlinkPath: String(value) }),
+            packet_path: value => ({ packetPath: String(value) }),
+            snmp_path: value => ({ snmpPath: String(value) }),
+            netstat_path: value => ({ netstatPath: String(value) }),
+            output_file: value => ({ outputFile: String(value) }),
+            color: value => ({ color: String(value).toLowerCase() }),
+            max_file_size: value => ({ maxFileSize: ProtocolStats.toInt(value) }),
+            max_line_count: value => ({ maxLineCount: ProtocolStats.toInt(value) }),
+            max_line_size: value => ({ maxLineSize: ProtocolStats.toInt(value) }),
+            allowed_roots: value => ({ allowedRoots: Array.isArray(value) ? value.map(String) : [String(value)] })
+        };
+
+        for (const [key, value] of Object.entries(data || {})) {
+            if (!Object.prototype.hasOwnProperty.call(rules, key)) {
+                continue;
+            }
+            const partial = rules[key](value);
+            for (const [partialKey, partialValue] of Object.entries(partial)) {
+                if (partialValue !== undefined) {
+                    mapped[partialKey] = partialValue;
+                }
+            }
+        }
+        return mapped;
+    }
+}
+
+class ProtocolRegistry {
+    constructor(tool) {
+        this.tool = tool;
+        this.sectionParsers = this.buildSectionParsers();
+        this.extendedFileSpecs = this.buildExtendedFileSpecs();
+    }
+
+    buildSectionParsers() {
+        return {
+            "sockets:": (parts, report) => {
+                if (parts.length >= 3) {
+                    report.setSocketsUsed(this.tool.parseInt(parts[2]));
+                }
+            },
+            "TCP:": (parts, report) => {
+                this.tool.parseProtocolSection(parts, report, "tcp", {
+                    inuse: "in_use",
+                    orphan: "orphan",
+                    tw: "time_wait",
+                    alloc: "allocated",
+                    mem: "memory"
+                });
+            },
+            "UDP:": (parts, report) => {
+                this.tool.parseProtocolSection(parts, report, "udp", {
+                    inuse: "in_use",
+                    mem: "memory"
+                });
+            },
+            "UDPLITE:": (parts, report) => {
+                this.tool.parseProtocolSection(parts, report, "udp_lite", {
+                    inuse: "in_use"
+                });
+            },
+            "RAW:": (parts, report) => {
+                this.tool.parseProtocolSection(parts, report, "raw", {
+                    inuse: "in_use"
+                });
+            },
+            "FRAG:": (parts, report) => {
+                this.tool.parseProtocolSection(parts, report, "frag", {
+                    inuse: "in_use",
+                    memory: "memory"
+                });
+            },
+            "TCP6:": (parts, report) => {
+                if (this.tool.config.extended && report.hasProtocol("tcp6")) {
+                    this.tool.parseProtocolSection(parts, report, "tcp6", {
+                        inuse: "in_use",
+                        orphan: "orphan",
+                        tw: "time_wait",
+                        alloc: "allocated",
+                        mem: "memory"
+                    });
+                }
+            },
+            "UDP6:": (parts, report) => {
+                if (this.tool.config.extended && report.hasProtocol("udp6")) {
+                    this.tool.parseProtocolSection(parts, report, "udp6", {
+                        inuse: "in_use",
+                        mem: "memory"
+                    });
+                }
+            }
+        };
+    }
+
+    buildExtendedFileSpecs() {
+        return [
+            {
+                filePathKey: "sockstat6Path",
+                section: "TCP6:",
+                protocolKey: "tcp6",
+                mapping: {
+                    inuse: "in_use",
+                    orphan: "orphan",
+                    tw: "time_wait",
+                    alloc: "allocated",
+                    mem: "memory"
+                }
+            },
+            {
+                filePathKey: "sockstat6Path",
+                section: "UDP6:",
+                protocolKey: "udp6",
+                mapping: {
+                    inuse: "in_use",
+                    mem: "memory"
+                }
+            },
+            {
+                filePathKey: "sockstat6Path",
+                section: "UNIX:",
+                protocolKey: "unix",
+                mapping: {
+                    inuse: "in_use",
+                    dynamic: "dynamic",
+                    inode: "inode"
+                }
+            }
+        ];
+    }
+}
+
 class SocketStatsTool {
     constructor() {
         this.config = new ToolConfig();
@@ -641,8 +865,15 @@ class SocketStatsTool {
         this.metrics = new PerformanceMetrics(process.hrtime.bigint(), process.memoryUsage());
         this.shutdownRequested = false;
         this.fileReader = new SafeFileReader(this.config, this.logger);
-        this.protocolParserCache = null;
+        this.protocolRegistry = new ProtocolRegistry(this);
         this.boundSignalHandler = this.handleSignal.bind(this);
+    }
+
+    refreshRuntimeHelpers() {
+        this.logger.setLevel(this.config.logLevel);
+        this.logger.setQuiet(this.config.quiet);
+        this.fileReader = new SafeFileReader(this.config, this.logger);
+        this.protocolRegistry = new ProtocolRegistry(this);
     }
 
     handleSignal(signalName) {
@@ -651,8 +882,7 @@ class SocketStatsTool {
     }
 
     installSignalHandlers() {
-        const signals = ["SIGINT", "SIGTERM", "SIGHUP"];
-        for (const sig of signals) {
+        for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
             try {
                 process.on(sig, this.boundSignalHandler);
             } catch (err) {
@@ -662,117 +892,9 @@ class SocketStatsTool {
     }
 
     parseArgs(argv = process.argv.slice(2)) {
-        const updates = {};
-        for (let i = 0; i < argv.length; i += 1) {
-            const arg = argv[i];
-            if (arg === "--json") {
-                updates.jsonOutput = true;
-                continue;
-            }
-            if (arg === "--compact-json") {
-                updates.jsonOutput = true;
-                updates.compactJson = true;
-                continue;
-            }
-            if (arg === "--help") {
-                updates.help = true;
-                continue;
-            }
-            if (arg === "--performance") {
-                updates.showPerformance = true;
-                continue;
-            }
-            if (arg === "--quiet") {
-                updates.quiet = true;
-                continue;
-            }
-            if (arg === "--extended") {
-                updates.extended = true;
-                continue;
-            }
-            if (arg === "--include-zeros") {
-                updates.includeZeros = true;
-                continue;
-            }
-            if (arg === "--version") {
-                this.showVersion();
-                process.exit(0);
-            }
-            if (arg === "--log-level") {
-                i += 1;
-                if (i >= argv.length) {
-                    throw new Error("Missing value for --log-level");
-                }
-                updates.logLevel = String(argv[i]).toUpperCase();
-                continue;
-            }
-            if (arg === "--path") {
-                i += 1;
-                if (i >= argv.length) {
-                    throw new Error("Missing value for --path");
-                }
-                updates.sockstatPath = String(argv[i]);
-                continue;
-            }
-            if (arg === "--config") {
-                i += 1;
-                if (i >= argv.length) {
-                    throw new Error("Missing value for --config");
-                }
-                updates.configFile = String(argv[i]);
-                continue;
-            }
-            if (arg === "--output") {
-                i += 1;
-                if (i >= argv.length) {
-                    throw new Error("Missing value for --output");
-                }
-                updates.outputFile = String(argv[i]);
-                continue;
-            }
-            if (arg === "--color") {
-                i += 1;
-                if (i >= argv.length) {
-                    throw new Error("Missing value for --color");
-                }
-                updates.color = String(argv[i]).toLowerCase();
-                continue;
-            }
-            if (arg === "--max-file-size") {
-                i += 1;
-                if (i >= argv.length) {
-                    throw new Error("Missing value for --max-file-size");
-                }
-                updates.maxFileSize = Number.parseInt(String(argv[i]), 10);
-                continue;
-            }
-            if (arg === "--max-line-count") {
-                i += 1;
-                if (i >= argv.length) {
-                    throw new Error("Missing value for --max-line-count");
-                }
-                updates.maxLineCount = Number.parseInt(String(argv[i]), 10);
-                continue;
-            }
-            if (arg === "--max-line-size") {
-                i += 1;
-                if (i >= argv.length) {
-                    throw new Error("Missing value for --max-line-size");
-                }
-                updates.maxLineSize = Number.parseInt(String(argv[i]), 10);
-                continue;
-            }
-            throw new Error(`Unknown argument: ${arg}`);
-        }
+        const updates = new ArgParser(argv).parse();
         this.config.apply(updates);
         this.refreshRuntimeHelpers();
-    }
-
-    refreshRuntimeHelpers() {
-        this.logger.setLevel(this.config.logLevel);
-        this.logger.setQuiet(this.config.quiet);
-        this.fileReader = new SafeFileReader(this.config, this.logger);
-        this.protocolParserCache = null;
     }
 
     loadConfigFile() {
@@ -781,74 +903,7 @@ class SocketStatsTool {
         }
         const { resolved, lines } = this.fileReader.readLines(this.config.configFile);
         const data = IniLoader.parse(lines.join("\n"));
-        const mapped = {};
-        for (const [k, v] of Object.entries(data)) {
-            switch (k) {
-                case "log_level":
-                    mapped.logLevel = String(v).toUpperCase();
-                    break;
-                case "json_output":
-                    mapped.jsonOutput = Boolean(v);
-                    break;
-                case "compact_json":
-                    mapped.compactJson = Boolean(v);
-                    break;
-                case "help":
-                    mapped.help = Boolean(v);
-                    break;
-                case "show_performance":
-                    mapped.showPerformance = Boolean(v);
-                    break;
-                case "quiet":
-                    mapped.quiet = Boolean(v);
-                    break;
-                case "extended":
-                    mapped.extended = Boolean(v);
-                    break;
-                case "include_zeros":
-                    mapped.includeZeros = Boolean(v);
-                    break;
-                case "sockstat_path":
-                    mapped.sockstatPath = String(v);
-                    break;
-                case "sockstat6_path":
-                    mapped.sockstat6Path = String(v);
-                    break;
-                case "netlink_path":
-                    mapped.netlinkPath = String(v);
-                    break;
-                case "packet_path":
-                    mapped.packetPath = String(v);
-                    break;
-                case "snmp_path":
-                    mapped.snmpPath = String(v);
-                    break;
-                case "netstat_path":
-                    mapped.netstatPath = String(v);
-                    break;
-                case "output_file":
-                    mapped.outputFile = String(v);
-                    break;
-                case "color":
-                    mapped.color = String(v).toLowerCase();
-                    break;
-                case "max_file_size":
-                    mapped.maxFileSize = ProtocolStats.toInt(v);
-                    break;
-                case "max_line_count":
-                    mapped.maxLineCount = ProtocolStats.toInt(v);
-                    break;
-                case "max_line_size":
-                    mapped.maxLineSize = ProtocolStats.toInt(v);
-                    break;
-                case "allowed_roots":
-                    mapped.allowedRoots = Array.isArray(v) ? v.map(String) : [String(v)];
-                    break;
-                default:
-                    break;
-            }
-        }
-        this.config.apply(mapped);
+        this.config.apply(ConfigMapper.mapIni(data));
         this.refreshRuntimeHelpers();
         this.logger.debug(`Loaded configuration from ${resolved}`);
     }
@@ -870,15 +925,24 @@ class SocketStatsTool {
         if (!Number.isInteger(this.config.maxLineSize) || this.config.maxLineSize < 1) {
             throw new Error("Invalid max line size");
         }
-        const pathFields = [
+        if (!Array.isArray(this.config.allowedRoots) || this.config.allowedRoots.length === 0) {
+            throw new Error("Invalid allowed roots");
+        }
+
+        for (const root of this.config.allowedRoots) {
+            if (typeof root !== "string" || root.includes("\0") || root.trim() === "") {
+                throw new Error("Invalid allowed root entry");
+            }
+        }
+
+        for (const field of [
             "sockstatPath",
             "sockstat6Path",
             "netlinkPath",
             "packetPath",
             "snmpPath",
             "netstatPath"
-        ];
-        for (const field of pathFields) {
+        ]) {
             const value = this.config[field];
             if (typeof value !== "string" || value.includes("\0") || value.trim() === "") {
                 throw new Error(`Invalid path in config field: ${field}`);
@@ -891,126 +955,109 @@ class SocketStatsTool {
 
     createEmptyReport() {
         const report = new SocketStatsReport(Metadata.create(this.config.sockstatPath));
-
-        report.addProtocol("tcp", new ProtocolStats("TCP", {
-            in_use: 0,
-            orphan: 0,
-            time_wait: 0,
-            allocated: 0,
-            memory: 0
-        }));
-        report.addProtocol("udp", new ProtocolStats("UDP", {
-            in_use: 0,
-            memory: 0
-        }));
-        report.addProtocol("udp_lite", new ProtocolStats("UDPLite", {
-            in_use: 0
-        }));
-        report.addProtocol("raw", new ProtocolStats("RAW", {
-            in_use: 0
-        }));
-        report.addProtocol("frag", new ProtocolStats("FRAG", {
-            in_use: 0,
-            memory: 0
-        }));
-
-        if (this.config.extended) {
-            report.addProtocol("tcp6", new ProtocolStats("TCP6", {
-                in_use: 0,
-                orphan: 0,
-                time_wait: 0,
-                allocated: 0,
-                memory: 0
-            }));
-            report.addProtocol("udp6", new ProtocolStats("UDP6", {
-                in_use: 0,
-                memory: 0
-            }));
-            report.addProtocol("unix", new ProtocolStats("UNIX", {
-                in_use: 0,
-                dynamic: 0,
-                inode: 0
-            }));
-            report.addProtocol("icmp", new ProtocolStats("ICMP", {
-                in_use: 0
-            }));
-            report.addProtocol("icmp6", new ProtocolStats("ICMP6", {
-                in_use: 0
-            }));
-            report.addProtocol("netlink", new ProtocolStats("Netlink", {
-                in_use: 0
-            }));
-            report.addProtocol("packet", new ProtocolStats("Packet", {
-                in_use: 0,
-                memory: 0
-            }));
-        }
-
-        return report;
-    }
-
-    getProtocolParsers() {
-        if (this.protocolParserCache) {
-            return this.protocolParserCache;
-        }
-        this.protocolParserCache = {
-            "sockets:": (parts, report) => {
-                if (parts.length >= 3) {
-                    report.setSocketsUsed(this.parseInt(parts[2]));
+        const baseProtocols = {
+            tcp: {
+                name: "TCP",
+                fields: {
+                    in_use: 0,
+                    orphan: 0,
+                    time_wait: 0,
+                    allocated: 0,
+                    memory: 0
                 }
             },
-            "TCP:": (parts, report) => {
-                this.parseProtocolSection(parts, report, "tcp", {
-                    inuse: "in_use",
-                    orphan: "orphan",
-                    tw: "time_wait",
-                    alloc: "allocated",
-                    mem: "memory"
-                });
-            },
-            "UDP:": (parts, report) => {
-                this.parseProtocolSection(parts, report, "udp", {
-                    inuse: "in_use",
-                    mem: "memory"
-                });
-            },
-            "UDPLITE:": (parts, report) => {
-                this.parseProtocolSection(parts, report, "udp_lite", {
-                    inuse: "in_use"
-                });
-            },
-            "RAW:": (parts, report) => {
-                this.parseProtocolSection(parts, report, "raw", {
-                    inuse: "in_use"
-                });
-            },
-            "FRAG:": (parts, report) => {
-                this.parseProtocolSection(parts, report, "frag", {
-                    inuse: "in_use",
-                    memory: "memory"
-                });
-            },
-            "TCP6:": (parts, report) => {
-                if (this.config.extended && report.hasProtocol("tcp6")) {
-                    this.parseProtocolSection(parts, report, "tcp6", {
-                        inuse: "in_use",
-                        orphan: "orphan",
-                        tw: "time_wait",
-                        alloc: "allocated",
-                        mem: "memory"
-                    });
+            udp: {
+                name: "UDP",
+                fields: {
+                    in_use: 0,
+                    memory: 0
                 }
             },
-            "UDP6:": (parts, report) => {
-                if (this.config.extended && report.hasProtocol("udp6")) {
-                    this.parseProtocolSection(parts, report, "udp6", {
-                        inuse: "in_use",
-                        mem: "memory"
-                    });
+            udp_lite: {
+                name: "UDPLite",
+                fields: {
+                    in_use: 0
+                }
+            },
+            raw: {
+                name: "RAW",
+                fields: {
+                    in_use: 0
+                }
+            },
+            frag: {
+                name: "FRAG",
+                fields: {
+                    in_use: 0,
+                    memory: 0
                 }
             }
         };
-        return this.protocolParserCache;
+
+        const extendedProtocols = {
+            tcp6: {
+                name: "TCP6",
+                fields: {
+                    in_use: 0,
+                    orphan: 0,
+                    time_wait: 0,
+                    allocated: 0,
+                    memory: 0
+                }
+            },
+            udp6: {
+                name: "UDP6",
+                fields: {
+                    in_use: 0,
+                    memory: 0
+                }
+            },
+            unix: {
+                name: "UNIX",
+                fields: {
+                    in_use: 0,
+                    dynamic: 0,
+                    inode: 0
+                }
+            },
+            icmp: {
+                name: "ICMP",
+                fields: {
+                    in_use: 0
+                }
+            },
+            icmp6: {
+                name: "ICMP6",
+                fields: {
+                    in_use: 0
+                }
+            },
+            netlink: {
+                name: "Netlink",
+                fields: {
+                    in_use: 0
+                }
+            },
+            packet: {
+                name: "Packet",
+                fields: {
+                    in_use: 0,
+                    memory: 0
+                }
+            }
+        };
+
+        for (const [key, spec] of Object.entries(baseProtocols)) {
+            report.addProtocol(key, new ProtocolStats(spec.name, spec.fields));
+        }
+
+        if (this.config.extended) {
+            for (const [key, spec] of Object.entries(extendedProtocols)) {
+                report.addProtocol(key, new ProtocolStats(spec.name, spec.fields));
+            }
+        }
+
+        return report;
     }
 
     parseInt(value) {
@@ -1051,13 +1098,11 @@ class SocketStatsTool {
             this.logger.debug(`Skipping malformed line: ${line}`);
             return;
         }
-        const section = parts[0];
-        const parsers = this.getProtocolParsers();
-        const fn = parsers[section];
+        const fn = this.protocolRegistry.sectionParsers[parts[0]];
         if (fn) {
             fn(parts, report);
         } else {
-            this.logger.debug(`Unknown section: ${section}`);
+            this.logger.debug(`Unknown section: ${parts[0]}`);
         }
     }
 
@@ -1098,13 +1143,27 @@ class SocketStatsTool {
                 if (line.startsWith(section)) {
                     const parts = line.split(/\s+/);
                     this.parseProtocolSection(parts, report, protocolKey, mapping);
-                    return;
+                    return true;
                 }
             }
             report.addNote(`Section ${section} not found in ${resolved}`);
+            return false;
         } catch (err) {
             report.addReadSource(filePath, "unavailable");
             this.logger.debug(`Could not load protocol section ${section} from ${filePath}: ${err.message}`);
+            return false;
+        }
+    }
+
+    loadExtendedSectionFiles(report) {
+        for (const spec of this.protocolRegistry.extendedFileSpecs) {
+            this.loadProtocolSectionFromFile(
+                this.config[spec.filePathKey],
+                spec.section,
+                report,
+                spec.protocolKey,
+                spec.mapping
+            );
         }
     }
 
@@ -1127,6 +1186,20 @@ class SocketStatsTool {
         return { resolved, count };
     }
 
+    setProtocolCountFromFile(report, protocolKey, filePath, skipHeader = true) {
+        try {
+            const { resolved, count } = this.countFileEntries(filePath, skipHeader);
+            report.addReadSource(resolved, "ok");
+            const proto = report.tryGetProtocol(protocolKey);
+            if (proto) {
+                proto.set("in_use", count);
+            }
+        } catch (err) {
+            report.addReadSource(filePath, "unavailable");
+            this.logger.debug(`Could not load ${protocolKey} info: ${err.message}`);
+        }
+    }
+
     loadSnmpMetric(filePath, targetSection) {
         const { resolved, lines } = this.fileReader.readLines(filePath);
         for (let i = 0; i < lines.length - 1; i += 1) {
@@ -1147,6 +1220,24 @@ class SocketStatsTool {
             return { resolved, mapping };
         }
         return { resolved, mapping: {} };
+    }
+
+    setProtocolAggregateFromSnmp(report, protocolKey, sectionName) {
+        try {
+            const { resolved, mapping } = this.loadSnmpMetric(this.config.snmpPath, sectionName);
+            report.addReadSource(resolved, "ok");
+            const proto = report.tryGetProtocol(protocolKey);
+            if (proto) {
+                let total = 0;
+                for (const value of Object.values(mapping)) {
+                    total += value;
+                }
+                proto.set("in_use", total);
+            }
+        } catch (err) {
+            report.addReadSource(this.config.snmpPath, "unavailable");
+            this.logger.debug(`Could not load ${protocolKey} info: ${err.message}`);
+        }
     }
 
     parseTcpExtPairs(line) {
@@ -1205,119 +1296,29 @@ class SocketStatsTool {
         if (!this.config.extended) {
             return;
         }
-
-        this.loadProtocolSectionFromFile(
-            this.config.sockstat6Path,
-            "TCP6:",
-            report,
-            "tcp6",
-            {
-                inuse: "in_use",
-                orphan: "orphan",
-                tw: "time_wait",
-                alloc: "allocated",
-                mem: "memory"
-            }
-        );
-
-        this.loadProtocolSectionFromFile(
-            this.config.sockstat6Path,
-            "UDP6:",
-            report,
-            "udp6",
-            {
-                inuse: "in_use",
-                mem: "memory"
-            }
-        );
-
-        this.loadProtocolSectionFromFile(
-            this.config.sockstat6Path,
-            "UNIX:",
-            report,
-            "unix",
-            {
-                inuse: "in_use",
-                dynamic: "dynamic",
-                inode: "inode"
-            }
-        );
-
-        try {
-            const { resolved, count } = this.countFileEntries(this.config.netlinkPath, true);
-            report.addReadSource(resolved, "ok");
-            const proto = report.tryGetProtocol("netlink");
-            if (proto) {
-                proto.set("in_use", count);
-            }
-        } catch (err) {
-            report.addReadSource(this.config.netlinkPath, "unavailable");
-            this.logger.debug(`Could not load netlink info: ${err.message}`);
-        }
-
-        try {
-            const { resolved, count } = this.countFileEntries(this.config.packetPath, true);
-            report.addReadSource(resolved, "ok");
-            const proto = report.tryGetProtocol("packet");
-            if (proto) {
-                proto.set("in_use", count);
-            }
-        } catch (err) {
-            report.addReadSource(this.config.packetPath, "unavailable");
-            this.logger.debug(`Could not load packet info: ${err.message}`);
-        }
-
-        try {
-            const { resolved, mapping } = this.loadSnmpMetric(this.config.snmpPath, "Icmp:");
-            report.addReadSource(resolved, "ok");
-            const proto = report.tryGetProtocol("icmp");
-            if (proto) {
-                let total = 0;
-                for (const value of Object.values(mapping)) {
-                    total += value;
-                }
-                proto.set("in_use", total);
-            }
-        } catch (err) {
-            report.addReadSource(this.config.snmpPath, "unavailable");
-            this.logger.debug(`Could not load ICMP info: ${err.message}`);
-        }
-
-        try {
-            const { resolved, mapping } = this.loadSnmpMetric(this.config.snmpPath, "Icmp6:");
-            report.addReadSource(resolved, "ok");
-            const proto = report.tryGetProtocol("icmp6");
-            if (proto) {
-                let total = 0;
-                for (const value of Object.values(mapping)) {
-                    total += value;
-                }
-                proto.set("in_use", total);
-            }
-        } catch (err) {
-            report.addReadSource(this.config.snmpPath, "unavailable");
-            this.logger.debug(`Could not load ICMP6 info: ${err.message}`);
-        }
-
+        this.loadExtendedSectionFiles(report);
+        this.setProtocolCountFromFile(report, "netlink", this.config.netlinkPath, true);
+        this.setProtocolCountFromFile(report, "packet", this.config.packetPath, true);
+        this.setProtocolAggregateFromSnmp(report, "icmp", "Icmp:");
+        this.setProtocolAggregateFromSnmp(report, "icmp6", "Icmp6:");
         this.loadNetstat(report);
     }
 
-    displayStats(report) {
+    buildOutput(report) {
         const metrics = this.config.showPerformance ? this.metrics.toJSON() : null;
-        let output;
         if (this.config.jsonOutput) {
             const payload = report.toJSONObject(this.config.includeZeros);
             if (metrics) {
                 payload.performance = metrics;
             }
-            output = this.config.compactJson
+            return (this.config.compactJson
                 ? JSON.stringify(payload)
-                : JSON.stringify(payload, null, 2);
-            output += "\n";
-        } else {
-            output = new TerminalFormatter(this.config).outputHumanReadable(report, metrics);
+                : JSON.stringify(payload, null, 2)) + "\n";
         }
+        return new TerminalFormatter(this.config).outputHumanReadable(report, metrics);
+    }
 
+    writeOutput(output) {
         if (this.config.outputFile) {
             fs.writeFileSync(this.config.outputFile, output, "utf8");
             if (!this.config.quiet) {
@@ -1325,21 +1326,20 @@ class SocketStatsTool {
             }
             return;
         }
-
         if (!this.config.quiet) {
             process.stdout.write(output);
         }
     }
 
     showVersion() {
-        process.stdout.write("Socket Statistics Tool JS 2.0.0\n");
+        process.stdout.write(`Socket Statistics Tool JS ${VERSION}\n`);
         process.stdout.write(`Node ${process.version}\n`);
     }
 
     showHelp() {
         const scriptName = path.basename(process.argv[1] || "main.js");
-        const text = [
-            "Socket Statistics Tool JS 2.0.0",
+        process.stdout.write([
+            `Socket Statistics Tool JS ${VERSION}`,
             "",
             `Usage: ${scriptName} [OPTIONS]`,
             "",
@@ -1367,27 +1367,40 @@ class SocketStatsTool {
             `  ${scriptName} --path /tmp/test-sockstat --json`,
             `  ${scriptName} --config /etc/socket-stats/config.ini --compact-json`,
             ""
-        ].join("\n");
-        process.stdout.write(text);
+        ].join("\n"));
+    }
+
+    execute() {
+        this.loadConfigFile();
+        this.validateConfig();
+
+        if (this.config.help) {
+            this.showHelp();
+            return 0;
+        }
+
+        if (this.config.version) {
+            this.showVersion();
+            return 0;
+        }
+
+        const report = this.createEmptyReport();
+        this.logger.info(`Reading socket statistics from ${this.config.sockstatPath}`);
+        this.readSockstat(report);
+        this.loadExtendedProtocolInfo(report);
+        report.refreshSummary();
+        this.metrics.stop();
+        const output = this.buildOutput(report);
+        this.writeOutput(output);
+        return 0;
     }
 
     run() {
         this.installSignalHandlers();
         try {
             this.parseArgs();
-            if (this.config.help) {
-                this.showHelp();
-                return;
-            }
-            this.loadConfigFile();
-            this.validateConfig();
-            const report = this.createEmptyReport();
-            this.logger.info(`Reading socket statistics from ${this.config.sockstatPath}`);
-            this.readSockstat(report);
-            this.loadExtendedProtocolInfo(report);
-            report.refreshSummary();
-            this.metrics.stop();
-            this.displayStats(report);
+            const exitCode = this.execute();
+            process.exitCode = exitCode;
         } catch (err) {
             this.metrics.stop();
             this.logger.error(err && err.message ? err.message : String(err));
