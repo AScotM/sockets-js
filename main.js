@@ -7,7 +7,7 @@ const path = require("path");
 const os = require("os");
 const process = require("process");
 
-const VERSION = "2.2.0";
+const VERSION = "4.0.0";
 
 class ToolConfig {
     constructor(options = {}) {
@@ -35,6 +35,18 @@ class ToolConfig {
         this.maxLineCount = 10000;
         this.maxLineSize = 1024 * 1024;
         this.includeZeros = false;
+        this.tcpStates = false;
+        this.processes = false;
+        this.processLimit = 25;
+        this.watch = false;
+        this.interval = 2;
+        this.count = 0;
+        this.csvOutput = false;
+        this.thresholdTcp = null;
+        this.thresholdEstablished = null;
+        this.thresholdTimewait = null;
+        this.thresholdOrphan = null;
+        this.thresholdRetrans = null;
         this.apply(options);
     }
 
@@ -174,9 +186,13 @@ class ProtocolStats {
             return value;
         }
 
-        const parsed = Number.parseInt(String(value), 10);
+        const raw = String(value);
+        if (!/^-?\d+$/.test(raw)) {
+            throw new Error(`Invalid integer value: ${value}`);
+        }
+        const parsed = Number(raw);
 
-        if (!Number.isFinite(parsed)) {
+        if (!Number.isSafeInteger(parsed)) {
             throw new Error(`Failed to parse integer value: ${value}`);
         }
 
@@ -293,6 +309,12 @@ class SocketStatsReport {
         this.sockets_used = 0;
         this.protocols = new Map();
         this.tcp_ext = {};
+        this.tcp_states = {};
+        this.auxiliary = {};
+        this.processes = [];
+        this.counters = {};
+        this.sampling = null;
+        this.alerts = [];
         this.notes = [];
         this.read_sources = [];
 
@@ -418,7 +440,13 @@ class SocketStatsReport {
             metadata: this.metadata.toJSON(),
             sockets_used: this.sockets_used,
             summary: { ...this.summary },
-            read_sources: [...this.read_sources]
+            read_sources: [...this.read_sources],
+            tcp_states: {...this.tcp_states},
+            auxiliary: {...this.auxiliary},
+            processes: [...this.processes],
+            counters: {...this.counters},
+            sampling: this.sampling,
+            alerts: [...this.alerts]
         };
 
         for (const [key, proto] of this.protocols.entries()) {
@@ -1077,6 +1105,55 @@ class ArgParser {
                     this.updates.extended = true;
                     break;
 
+                case "--tcp-states":
+                    this.updates.tcpStates = true;
+                    break;
+
+                case "--processes":
+                    this.updates.processes = true;
+                    this.updates.tcpStates = true;
+                    break;
+
+                case "--watch":
+                    this.updates.watch = true;
+                    break;
+
+                case "--csv":
+                    this.updates.csvOutput = true;
+                    break;
+
+                case "--interval":
+                    this.updates.interval = Number(this.nextValue(arg));
+                    break;
+
+                case "--count":
+                    this.updates.count = Number(this.nextValue(arg));
+                    break;
+
+                case "--process-limit":
+                    this.updates.processLimit = Number(this.nextValue(arg));
+                    break;
+
+                case "--threshold-tcp":
+                    this.updates.thresholdTcp = Number(this.nextValue(arg));
+                    break;
+
+                case "--threshold-established":
+                    this.updates.thresholdEstablished = Number(this.nextValue(arg));
+                    break;
+
+                case "--threshold-timewait":
+                    this.updates.thresholdTimewait = Number(this.nextValue(arg));
+                    break;
+
+                case "--threshold-orphan":
+                    this.updates.thresholdOrphan = Number(this.nextValue(arg));
+                    break;
+
+                case "--threshold-retrans":
+                    this.updates.thresholdRetrans = Number(this.nextValue(arg));
+                    break;
+
                 case "--include-zeros":
                     this.updates.includeZeros = true;
                     break;
@@ -1178,6 +1255,19 @@ class ConfigMapper {
             extended: value => ({
                 extended: Boolean(value)
             }),
+
+            tcp_states: value => ({tcpStates: Boolean(value)}),
+            processes: value => ({processes: Boolean(value)}),
+            watch: value => ({watch: Boolean(value)}),
+            csv_output: value => ({csvOutput: Boolean(value)}),
+            interval: value => ({interval: Number(value)}),
+            count: value => ({count: Number(value)}),
+            process_limit: value => ({processLimit: Number(value)}),
+            threshold_tcp: value => ({thresholdTcp: Number(value)}),
+            threshold_established: value => ({thresholdEstablished: Number(value)}),
+            threshold_timewait: value => ({thresholdTimewait: Number(value)}),
+            threshold_orphan: value => ({thresholdOrphan: Number(value)}),
+            threshold_retrans: value => ({thresholdRetrans: Number(value)}),
 
             include_zeros: value => ({
                 includeZeros: Boolean(value)
@@ -1422,6 +1512,447 @@ class ProtocolRegistry {
     }
 }
 
+
+class AdvancedSocketInspector {
+    constructor(config, logger) {
+        this.config = config;
+        this.logger = logger;
+        this.procRoot = path.dirname(path.dirname(this.config.sockstatPath));
+        this.stateNames = {
+            "01": "ESTABLISHED",
+            "02": "SYN_SENT",
+            "03": "SYN_RECV",
+            "04": "FIN_WAIT1",
+            "05": "FIN_WAIT2",
+            "06": "TIME_WAIT",
+            "07": "CLOSE",
+            "08": "CLOSE_WAIT",
+            "09": "LAST_ACK",
+            "0A": "LISTEN",
+            "0B": "CLOSING",
+            "0C": "NEW_SYN_RECV"
+        };
+        this.inodes = new Set();
+    }
+
+    source(name) {
+        return path.join(this.procRoot, "net", name);
+    }
+
+    read(name, report) {
+        const file = this.source(name);
+        try {
+            const stat = fs.statSync(file);
+            if (!stat.isFile() || stat.size > this.config.maxFileSize) {
+                throw new Error("Source is not a readable file within size limits");
+            }
+            const text = fs.readFileSync(file, "utf8");
+            if (Buffer.byteLength(text) > this.config.maxFileSize) {
+                throw new Error("Source exceeded read limit");
+            }
+            report.addReadSource(file, "ok");
+            return text;
+        } catch (err) {
+            report.addReadSource(file, "unavailable");
+            this.logger.debug(`${file}: ${err.message}`);
+            return null;
+        }
+    }
+
+    parseTable(name, text, report) {
+        const lines = text.split(/\r?\n/);
+        let entries = 0;
+        for (const raw of lines.slice(1)) {
+            const fields = raw.trim().split(/\s+/);
+            if (fields.length < 10 || !/^\d+:$/.test(fields[0])) {
+                continue;
+            }
+            entries += 1;
+            const state = this.stateNames[fields[3].toUpperCase()] || "UNKNOWN";
+            report.tcp_states[state] = (report.tcp_states[state] || 0) + 1;
+            if (/^\d+$/.test(fields[9])) {
+                this.inodes.add(fields[9]);
+            }
+        }
+        report.auxiliary[`${name}_entries`] = entries;
+    }
+
+    parseSocketTable(name, text, report) {
+        const lines = text.split(/\r?\n/).slice(1);
+        let entries = 0;
+        for (const raw of lines) {
+            const fields = raw.trim().split(/\s+/);
+            if (fields.length < 10 || !/^\d+:$/.test(fields[0])) {
+                continue;
+            }
+            entries += 1;
+            if (/^\d+$/.test(fields[9])) {
+                this.inodes.add(fields[9]);
+            }
+        }
+        report.auxiliary[`${name}_entries`] = entries;
+    }
+
+    parseUnixTable(text, report) {
+        let entries = 0;
+        for (const raw of text.split(/\r?\n/).slice(1)) {
+            const fields = raw.trim().split(/\s+/);
+            if (fields.length < 7 || !/^\d+:$/.test(fields[0])) {
+                continue;
+            }
+            entries += 1;
+            if (/^\d+$/.test(fields[6])) {
+                this.inodes.add(fields[6]);
+            }
+        }
+        report.auxiliary.unix_entries = entries;
+    }
+
+    parseMib(text, report) {
+        const lines = text.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+        for (let i = 0; i + 1 < lines.length; i += 1) {
+            const keys = lines[i].split(/\s+/);
+            const values = lines[i + 1].split(/\s+/);
+            if (keys[0] !== values[0] || keys.length !== values.length) {
+                continue;
+            }
+            if (!keys[0].endsWith(":")) {
+                continue;
+            }
+            const section = keys[0].slice(0, -1);
+            const result = {};
+            for (let j = 1; j < keys.length; j += 1) {
+                const raw = values[j];
+                if (!/^-?\d+$/.test(raw)) {
+                    continue;
+                }
+                const value = Number(raw);
+                if (Number.isSafeInteger(value)) {
+                    result[keys[j]] = value;
+                }
+            }
+            report.counters[section] = result;
+            i += 1;
+        }
+    }
+
+    parseSnmp6(text, report) {
+        for (const raw of text.split(/\r?\n/)) {
+            const fields = raw.trim().split(/\s+/);
+            if (fields.length !== 2 || !/^-?\d+$/.test(fields[1])) {
+                continue;
+            }
+            const match = /^(Ip6|Icmp6|Udp6|Tcp6)(.+)$/.exec(fields[0]);
+            if (!match) {
+                continue;
+            }
+            const value = Number(fields[1]);
+            if (!Number.isSafeInteger(value)) {
+                continue;
+            }
+            if (!report.counters[match[1]]) {
+                report.counters[match[1]] = {};
+            }
+            report.counters[match[1]][match[2]] = value;
+        }
+    }
+
+    inspectProcesses(report) {
+        const result = [];
+        let pids;
+        try {
+            pids = fs.readdirSync(this.procRoot).filter(x => /^\d+$/.test(x));
+        } catch (err) {
+            report.addNote(`Process scan unavailable: ${err.message}`);
+            return;
+        }
+        for (const pid of pids) {
+            const dir = path.join(this.procRoot, pid, "fd");
+            let descriptors;
+            try {
+                descriptors = fs.readdirSync(dir);
+            } catch (_) {
+                continue;
+            }
+            const owned = new Set();
+            for (const fd of descriptors) {
+                let target;
+                try {
+                    target = fs.readlinkSync(path.join(dir, fd));
+                } catch (_) {
+                    continue;
+                }
+                const match = /^socket:\[(\d+)\]$/.exec(target);
+                if (match && this.inodes.has(match[1])) {
+                    owned.add(match[1]);
+                }
+            }
+            if (owned.size === 0) {
+                continue;
+            }
+            let command = "unknown";
+            try {
+                command = fs.readFileSync(path.join(this.procRoot, pid, "comm"), "utf8").trim();
+            } catch (_) {}
+            result.push({pid: Number(pid), command, sockets: owned.size});
+        }
+        result.sort((a, b) => b.sockets - a.sockets || a.pid - b.pid);
+        report.processes = result.slice(0, this.config.processLimit);
+    }
+
+    inspect(report) {
+        const needsTables = this.config.tcpStates || this.config.processes || this.config.extended;
+        if (needsTables) {
+            for (const name of ["tcp", "tcp6"]) {
+                const text = this.read(name, report);
+                if (text !== null) {
+                    this.parseTable(name, text, report);
+                }
+            }
+        }
+        if (this.config.processes || this.config.extended) {
+            for (const name of ["udp", "udp6", "udplite", "udplite6", "raw", "raw6"]) {
+                const text = this.read(name, report);
+                if (text !== null) {
+                    this.parseSocketTable(name, text, report);
+                }
+            }
+            const unix = this.read("unix", report);
+            if (unix !== null) {
+                this.parseUnixTable(unix, report);
+            }
+        }
+        if (this.config.extended || this.config.watch) {
+            for (const name of ["snmp", "netstat"]) {
+                const text = this.read(name, report);
+                if (text !== null) {
+                    this.parseMib(text, report);
+                }
+            }
+            if (this.config.extended) {
+                const text = this.read("snmp6", report);
+                if (text !== null) {
+                    this.parseSnmp6(text, report);
+                }
+            }
+        }
+        if (this.config.processes) {
+            this.inspectProcesses(report);
+        }
+    }
+}
+
+class SampleAnalyzer {
+    constructor(config) {
+        this.config = config;
+        this.previous = null;
+        this.counterNames = [
+            ["Tcp", "InSegs"],
+            ["Tcp", "OutSegs"],
+            ["Tcp", "RetransSegs"],
+            ["Tcp", "ActiveOpens"],
+            ["Tcp", "PassiveOpens"],
+            ["Tcp", "OutRsts"],
+            ["Udp", "InDatagrams"],
+            ["Udp", "OutDatagrams"],
+            ["Udp", "InErrors"],
+            ["TcpExt", "TCPSynRetrans"],
+            ["TcpExt", "TCPTimeouts"],
+            ["TcpExt", "TCPLossProbes"]
+        ];
+    }
+
+    analyze(report) {
+        const now = process.hrtime.bigint();
+        const rates = {};
+        let elapsed = null;
+        if (this.previous) {
+            elapsed = Number(now - this.previous.time) / 1e9;
+            if (elapsed > 0) {
+                for (const [section, key] of this.counterNames) {
+                    const a = report.counters[section]?.[key];
+                    const b = this.previous.counters[section]?.[key];
+                    if (Number.isSafeInteger(a) && Number.isSafeInteger(b) && a >= b) {
+                        rates[`${section}.${key}`] = Number(((a - b) / elapsed).toFixed(3));
+                    }
+                }
+            }
+        }
+        report.sampling = {
+            elapsed_seconds: elapsed === null ? null : Number(elapsed.toFixed(6)),
+            rates_per_second: rates
+        };
+        this.previous = {time: now, counters: JSON.parse(JSON.stringify(report.counters))};
+        const checks = [
+            ["tcp_in_use", report.tryGetProtocol("tcp")?.get("in_use"), this.config.thresholdTcp],
+            ["tcp_established", report.tcp_states.ESTABLISHED || 0, this.config.thresholdEstablished],
+            ["tcp_time_wait", report.tcp_states.TIME_WAIT || 0, this.config.thresholdTimewait],
+            ["tcp_orphan", report.tryGetProtocol("tcp")?.get("orphan"), this.config.thresholdOrphan],
+            ["tcp_retransmits_per_second", rates["Tcp.RetransSegs"], this.config.thresholdRetrans]
+        ];
+        report.alerts = checks.filter(([, value, limit]) =>
+            limit !== null && value !== undefined && value > limit
+        ).map(([metric, value, threshold]) => ({metric, value, threshold}));
+    }
+}
+
+class CsvFormatter {
+    static columns() {
+        return [
+            "timestamp", "hostname", "sockets_used", "tcp_in_use", "tcp_orphan",
+            "tcp_time_wait", "tcp_allocated", "tcp_memory", "udp_in_use",
+            "tcp_established", "tcp_listen", "tcp_close_wait", "tcp_syn_sent",
+            "tcp_table_entries", "tcp6_table_entries", "unix_entries", "process_count",
+            "elapsed_seconds", "tcp_in_segments_per_second", "tcp_out_segments_per_second",
+            "tcp_retransmits_per_second", "udp_in_datagrams_per_second",
+            "udp_out_datagrams_per_second", "alert_count"
+        ];
+    }
+
+    static escape(value) {
+        if (value === undefined || value === null) {
+            return "";
+        }
+        const str = String(value);
+        return /[",\r\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+    }
+
+    static row(report) {
+        const tcp = report.tryGetProtocol("tcp");
+        const udp = report.tryGetProtocol("udp");
+        const rates = report.sampling?.rates_per_second || {};
+        return [
+            report.metadata.generated_at, report.metadata.hostname, report.sockets_used,
+            tcp?.get("in_use"), tcp?.get("orphan"), tcp?.get("time_wait"),
+            tcp?.get("allocated"), tcp?.get("memory"), udp?.get("in_use"),
+            report.tcp_states.ESTABLISHED, report.tcp_states.LISTEN,
+            report.tcp_states.CLOSE_WAIT, report.tcp_states.SYN_SENT,
+            report.auxiliary.tcp_entries, report.auxiliary.tcp6_entries,
+            report.auxiliary.unix_entries, report.processes.length,
+            report.sampling?.elapsed_seconds, rates["Tcp.InSegs"],
+            rates["Tcp.OutSegs"], rates["Tcp.RetransSegs"],
+            rates["Udp.InDatagrams"], rates["Udp.OutDatagrams"], report.alerts.length
+        ].map(CsvFormatter.escape).join(",") + "\n";
+    }
+}
+
+class MonitoringSession {
+    constructor(tool) {
+        this.tool = tool;
+        this.analyzer = new SampleAnalyzer(tool.config);
+        this.samples = 0;
+        this.stopped = false;
+        this.csvHeaderWritten = false;
+        this.timer = null;
+        this.waitResolve = null;
+    }
+
+    stop() {
+        this.stopped = true;
+        if (this.timer !== null) {
+            clearTimeout(this.timer);
+            this.timer = null;
+        }
+        if (this.waitResolve) {
+            const resolve = this.waitResolve;
+            this.waitResolve = null;
+            resolve();
+        }
+    }
+
+    wait(ms) {
+        if (this.stopped) {
+            return Promise.resolve();
+        }
+        return new Promise(resolve => {
+            this.waitResolve = resolve;
+            this.timer = setTimeout(() => {
+                this.timer = null;
+                this.waitResolve = null;
+                resolve();
+            }, ms);
+        });
+    }
+
+    collect() {
+        const report = this.tool.createEmptyReport();
+        this.tool.readSockstat(report);
+        this.tool.loadExtendedProtocolInfo(report);
+        new AdvancedSocketInspector(this.tool.config, this.tool.logger).inspect(report);
+        report.refreshSummary();
+        this.analyzer.analyze(report);
+        return report;
+    }
+
+    output(report) {
+        let text;
+        if (this.tool.config.csvOutput) {
+            text = this.csvHeaderWritten ? "" : CsvFormatter.columns().join(",") + "\n";
+            text += CsvFormatter.row(report);
+            this.csvHeaderWritten = true;
+        } else if (this.tool.config.jsonOutput) {
+            const data = report.toJSONObject(this.tool.config.includeZeros);
+            if (this.tool.config.showPerformance) {
+                data.performance = this.tool.metrics.toJSON();
+            }
+            text = JSON.stringify(data, null, this.tool.config.compactJson ? 0 : 2) + "\n";
+        } else {
+            text = this.tool.buildOutput(report);
+            const extra = [];
+            if (Object.keys(report.tcp_states).length) {
+                extra.push("TCP connection states:");
+                for (const [key, value] of Object.entries(report.tcp_states).sort((a, b) => b[1] - a[1])) {
+                    extra.push(`  ${key}: ${value}`);
+                }
+            }
+            if (report.processes.length) {
+                extra.push("Socket-owning processes:");
+                for (const item of report.processes) {
+                    extra.push(`  PID ${item.pid} ${item.command}: ${item.sockets}`);
+                }
+            }
+            if (report.sampling && Object.keys(report.sampling.rates_per_second).length) {
+                extra.push("Counter rates per second:");
+                for (const [key, value] of Object.entries(report.sampling.rates_per_second)) {
+                    extra.push(`  ${key}: ${value}`);
+                }
+            }
+            if (report.alerts.length) {
+                extra.push("Threshold alerts:");
+                for (const alert of report.alerts) {
+                    extra.push(`  ${alert.metric}: ${alert.value} > ${alert.threshold}`);
+                }
+            }
+            if (extra.length) {
+                text += "\n" + extra.join("\n") + "\n";
+            }
+        }
+        if (this.tool.config.outputFile) {
+            fs.appendFileSync(this.tool.config.outputFile, text, "utf8");
+        } else if (!this.tool.config.quiet) {
+            process.stdout.write(text);
+        }
+    }
+
+    async run() {
+        if (this.tool.config.outputFile) {
+            fs.writeFileSync(this.tool.config.outputFile, "", "utf8");
+        }
+        while (!this.stopped && !this.tool.shutdownRequested) {
+            const started = process.hrtime.bigint();
+            const report = this.collect();
+            this.tool.metrics.stop();
+            this.output(report);
+            this.samples += 1;
+            if (!this.tool.config.watch || (this.tool.config.count > 0 && this.samples >= this.tool.config.count)) {
+                break;
+            }
+            const elapsed = Number(process.hrtime.bigint() - started) / 1e6;
+            await this.wait(Math.max(0, this.tool.config.interval * 1000 - elapsed));
+        }
+    }
+}
+
 class SocketStatsTool {
     constructor() {
         this.config = new ToolConfig();
@@ -1489,6 +2020,9 @@ class SocketStatsTool {
 
         this.shutdownRequested = true;
         this.interruptedSignal = signalName;
+        if (this.session) {
+            this.session.stop();
+        }
     }
 
     installSignalHandlers() {
@@ -1651,6 +2185,33 @@ class SocketStatsTool {
                     "Invalid allowed root entry"
                 );
             }
+        }
+
+        if (!Number.isFinite(this.config.interval) || this.config.interval <= 0) {
+            throw new Error("Interval must be positive");
+        }
+
+        for (const field of ["count", "processLimit"]) {
+            if (!Number.isSafeInteger(this.config[field]) || this.config[field] < 0) {
+                throw new Error(`Invalid ${field}`);
+            }
+        }
+
+        for (const field of [
+            "thresholdTcp",
+            "thresholdEstablished",
+            "thresholdTimewait",
+            "thresholdOrphan",
+            "thresholdRetrans"
+        ]) {
+            const value = this.config[field];
+            if (value !== null && (!Number.isFinite(value) || value < 0)) {
+                throw new Error(`Invalid ${field}`);
+            }
+        }
+
+        if (this.config.csvOutput && this.config.jsonOutput) {
+            throw new Error("CSV and JSON modes are mutually exclusive");
         }
 
         for (
@@ -1830,13 +2391,13 @@ class SocketStatsTool {
     }
 
     parseInt(value) {
-        const parsed =
-            Number.parseInt(
-                String(value),
-                10
-            );
+        const raw = String(value);
+        if (!/^-?\d+$/.test(raw)) {
+            throw new Error(`Invalid integer: ${value}`);
+        }
+        const parsed = Number(raw);
 
-        if (!Number.isInteger(parsed)) {
+        if (!Number.isSafeInteger(parsed)) {
             throw new Error(
                 `Failed to parse integer: ${value}`
             );
@@ -2543,30 +3104,6 @@ class SocketStatsTool {
                 return;
             }
 
-            for (const line of lines) {
-                if (
-                    line.startsWith(
-                        "TcpExt:"
-                    )
-                ) {
-                    const parsed =
-                        this.parseTcpExtPairs(
-                            line
-                        );
-
-                    if (
-                        Object.keys(
-                            parsed
-                        ).length > 0
-                    ) {
-                        report.setTcpExt(
-                            parsed
-                        );
-
-                        return;
-                    }
-                }
-            }
         } catch (err) {
             report.addReadSource(
                 this.config.netstatPath,
@@ -2709,6 +3246,18 @@ class SocketStatsTool {
                 "  --performance           Include performance metrics",
                 "  --quiet                 Suppress normal stdout output",
                 "  --extended              Read additional protocol information",
+                "  --tcp-states            Inspect TCP connection states",
+                "  --processes             Find processes owning sockets",
+                "  --process-limit N       Maximum displayed processes",
+                "  --watch                 Sample continuously",
+                "  --interval SECONDS      Sampling interval",
+                "  --count N               Number of samples; 0 means unlimited",
+                "  --csv                   Write CSV samples",
+                "  --threshold-tcp N       Alert when TCP in-use exceeds N",
+                "  --threshold-established N  Alert on established TCP count",
+                "  --threshold-timewait N  Alert on TIME_WAIT count",
+                "  --threshold-orphan N    Alert on orphan count",
+                "  --threshold-retrans N   Alert on retransmits per second",
                 "  --include-zeros         Include empty protocols in output",
                 "  --color MODE            auto, always, never",
                 "  --max-file-size BYTES   Maximum readable file size",
@@ -2727,83 +3276,44 @@ class SocketStatsTool {
         );
     }
 
-    execute() {
+    async execute() {
         this.loadConfigFile();
         this.validateConfig();
-
         if (this.config.help) {
             this.showHelp();
             return 0;
         }
-
         if (this.config.version) {
             this.showVersion();
             return 0;
         }
-
-        const report =
-            this.createEmptyReport();
-
-        this.logger.info(
-            `Reading socket statistics from ${this.config.sockstatPath}`
-        );
-
-        this.readSockstat(report);
-        this.loadExtendedProtocolInfo(
-            report
-        );
-
-        if (
-            this.shutdownRequested &&
-            this.interruptedSignal
-        ) {
-            report.addNote(
-                `Execution interrupted by ${this.interruptedSignal}`
-            );
-        }
-
-        report.refreshSummary();
-
-        this.metrics.stop();
-
-        const output =
-            this.buildOutput(report);
-
-        this.writeOutput(output);
-
-        if (this.shutdownRequested) {
-            return 130;
-        }
-
-        return 0;
+        const session = new MonitoringSession(this);
+        this.session = session;
+        await session.run();
+        return this.shutdownRequested ? 130 : 0;
     }
 
-    run() {
+    async run() {
         this.installSignalHandlers();
-
         try {
             this.parseArgs();
-
-            const exitCode =
-                this.execute();
-
-            process.exitCode =
-                exitCode;
+            process.exitCode = await this.execute();
         } catch (err) {
             this.metrics.stop();
-
-            this.logger.error(
-                err &&
-                err.message
-                    ? err.message
-                    : String(err)
-            );
-
+            this.logger.error(err && err.message ? err.message : String(err));
             process.exitCode = 1;
         }
     }
+
 }
 
 if (require.main === module) {
+    process.stdout.on("error", err => {
+        if (err.code === "EPIPE") {
+            process.exit(0);
+        }
+        process.stderr.write(`${err.message}\n`);
+        process.exitCode = 1;
+    });
     new SocketStatsTool().run();
 }
